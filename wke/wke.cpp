@@ -7,6 +7,7 @@
 #include "content/web_impl_win/BlinkPlatformImpl.h"
 #include "content/web_impl_win/WebCookieJarCurlImpl.h"
 #include "content/web_impl_win/WebThreadImpl.h"
+#include "content/web_impl_win/npapi/PluginDatabase.h"
 #include "net/WebURLLoaderManager.h"
 
 //cexer: 必须包含在后面，因为其中的 wke.h -> windows.h 会定义 max、min，导致 WebCore 内部的 max、min 出现错乱。
@@ -22,6 +23,7 @@
 #include "gen/blink/platform/RuntimeEnabledFeatures.h"
 #include <v8.h>
 #include "wtf/text/WTFString.h"
+#include "wtf/text/WTFStringUtil.h"
 
 namespace net {
 void setCookieJarPath(const WCHAR* path);
@@ -29,6 +31,7 @@ void setCookieJarFullPath(const WCHAR* path);
 }
 
 bool g_isSetDragEnable = true;
+bool g_isSetDragDropEnable = true;
 
 namespace blink {
 extern char* g_navigatorPlatform;
@@ -84,7 +87,7 @@ void wkeSetProxy(const wkeProxy* proxy)
     if (!proxy)
         return;
 
-    WTF::PassOwnPtr<wkeProxyInfo> info = wkeProxyInfo::create(*proxy);
+    WTF::OwnPtr<wkeProxyInfo> info = wkeProxyInfo::create(*proxy);
 
     if (net::WebURLLoaderManager::sharedInstance())
         net::WebURLLoaderManager::sharedInstance()->setProxyInfo(info->hostname, proxy->port, info->proxyType, info->username, info->password);
@@ -94,7 +97,7 @@ void wkeSetViewProxy(wkeWebView webView, wkeProxy* proxy)
 {
     if (!webView || !proxy)
         return;
-    WTF::PassOwnPtr<wkeProxyInfo> info = wkeProxyInfo::create(*proxy);
+    WTF::OwnPtr<wkeProxyInfo> info = wkeProxyInfo::create(*proxy);
     webView->setProxyInfo(info->hostname, proxy->port, info->proxyType, info->username, info->password);
 }
 
@@ -184,9 +187,13 @@ void wkeSetDragEnable(wkeWebView webView, bool b)
     g_isSetDragEnable = b;
 }
 
-bool g_usingMouseZero = false;
-bool g_usingMovement = false;
-bool g_usingWindow = false;
+void wkeSetDragDropEnable(wkeWebView webView, bool b)
+{
+    g_isSetDragDropEnable = b;
+}
+
+DWORD g_kWakeMinInterval = 5;
+double g_kDrawMinInterval = 0.003;
 
 void wkeSetDebugConfig(wkeWebView webView, const char* debugString, const char* param)
 {
@@ -205,13 +212,12 @@ void wkeSetDebugConfig(wkeWebView webView, const char* debugString, const char* 
         } else if ("alwaysInflateDirtyRect" == item) {
 
         } else if ("showDevTools" == item) {
-            webView->showDevTools(param);
-        } else if ("usingMouseZero" == item) {
-            g_usingMouseZero = true;
-        } else if ("usingMovement" == item) {
-            g_usingMovement = true;
-        } else if ("usingWindow" == item) {
-            g_usingWindow = true;
+            webView->showDevTools(param, nullptr, nullptr);
+        } else if ("wakeMinInterval" == item) {
+            g_kWakeMinInterval = atoi(param);
+        } else if ("drawMinInterval" == item) {
+            int drawMinInterval = atoi(param);
+            g_kDrawMinInterval = drawMinInterval / 1000.0;
         }
     }
 }
@@ -301,6 +307,13 @@ void wkeSetUserAgent(wkeWebView webView, const utf8* userAgent)
 void wkeSetUserAgentW(wkeWebView webView, const wchar_t* userAgent)
 {
     webView->setUserAgent(userAgent);
+}
+
+void wkeShowDevtools(wkeWebView webView, const wchar_t* path, wkeOnShowDevtoolsCallback callback, void* param)
+{
+    std::vector<char> pathUtf8;
+    WTF::WCharToMByte(path, wcslen(path), &pathUtf8, CP_UTF8);
+    webView->showDevTools(&pathUtf8[0], callback, param);
 }
 
 void wkePostURL(wkeWebView wkeView,const utf8 * url,const char *szPostData,int nLen)
@@ -619,6 +632,12 @@ void wkeSetLocalStorageFullPath(wkeWebView webView, const WCHAR* path)
         kLocalStorageFullPath->append(L'\\');
 }
 
+void wkeAddPluginDirectory(wkeWebView webView, const WCHAR* path)
+{
+    String directory(path);
+    content::PluginDatabase::installedPlugins()->addExtraPluginDirectory(directory);
+}
+
 void wkeSetMediaVolume(wkeWebView webView, float volume)
 {
     webView->setMediaVolume(volume);
@@ -698,6 +717,11 @@ jsExecState wkeGlobalExec(wkeWebView webView)
     return webView->globalExec();
 }
 
+jsExecState wkeGetGlobalExecByFrame(wkeWebView webView, wkeWebFrameHandle frameId)
+{
+    return webView->globalExecByFrame(frameId);
+}
+
 void wkeSleep(wkeWebView webView)
 {
     webView->sleep();
@@ -714,8 +738,8 @@ void wkeWake(wkeWebView webView)
 
 //     String output = String::format("wkeWake: %d\n", time - lastTime);
 //     OutputDebugStringA(output.utf8().data());
-//     if (time - lastTime < 50)
-//         return;
+    if (time - lastTime < g_kWakeMinInterval)
+        return;
 
     lastTime = time;
 
@@ -1142,6 +1166,15 @@ void wkeSetWindowTitleW(wkeWebView webWindow, const wchar_t* title)
         return window->setTitle(title);
 }
 
+WKE_EXTERN_C wkeNodeOnCreateProcessCallback g_wkeNodeOnCreateProcessCallback = nullptr;
+WKE_EXTERN_C void* g_wkeNodeOnCreateProcessCallbackparam = nullptr;
+
+void wkeNodeOnCreateProcess(wkeWebView webWindow, wkeNodeOnCreateProcessCallback callback, void* param)
+{
+    g_wkeNodeOnCreateProcessCallback = callback;
+    g_wkeNodeOnCreateProcessCallbackparam = param;
+}
+
 static void convertDragData(blink::WebDragData* data, const wkeWebDragData* webDragData) {
     data->initialize();
 
@@ -1297,7 +1330,7 @@ void wkeGC(wkeWebView webView, long delayMs)
     platformImpl->startGarbageCollectedThread((double)delayMs);
 }
 
-extern "C" void curl_set_file_system(
+WKE_EXTERN_C void curl_set_file_system(
     WKE_FILE_OPEN pfnOpen,
     WKE_FILE_CLOSE pfnClose,
     WKE_FILE_SIZE pfnSize,

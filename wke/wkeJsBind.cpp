@@ -7,10 +7,11 @@
 #include "third_party/WebKit/Source/wtf/text/WTFStringUtil.h"
 #include "third_party/WebKit/Source/bindings/core/v8/V8StringResource.h"
 #include "third_party/WebKit/Source/bindings/core/v8/V8Binding.h"
+#include "third_party/WebKit/Source/bindings/core/v8/V8RecursionScope.h"
 #include "third_party/WebKit/Source/core/frame/LocalDOMWindow.h"
 #include "third_party/WebKit/Source/core/frame/LocalFrame.h"
 #include "third_party/WebKit/Source/core/page/ChromeClient.h"
-#include "third_party/WebKit/Source/bindings/core/v8/V8RecursionScope.h"
+#include "third_party/WebKit/Source/platform/UserGestureIndicator.h"
 #include "third_party/WebKit/public/web/WebScriptSource.h"
 #include "third_party/WebKit/public/web/WebLocalFrame.h"
 #include "content/browser/WebFrameClientImpl.h"
@@ -464,7 +465,8 @@ const wchar_t* jsToTempStringW(jsExecState es, jsValue v)
     return wke::createTempWCharString(utf16.data(), utf16.size());
 }
 
-const utf8* jsToTempString(jsExecState es, jsValue v) {
+const utf8* jsToTempString(jsExecState es, jsValue v)
+{
     if (!s_execStates || !s_execStates->contains(es) || !es)
         return "";
 
@@ -755,6 +757,7 @@ jsValue jsCall(jsExecState es, jsValue func, jsValue thisValue, jsValue* args, i
     v8::HandleScope handleScope(isolate);
     v8::Local<v8::Context> context = v8::Local<v8::Context>::New(es->isolate, es->context);
     v8::Context::Scope contextScope(context);
+    blink::UserGestureIndicator gestureIndicator(blink::DefinitelyProcessingUserGesture);
 
     v8::Local<v8::Value>* argv = new v8::Local<v8::Value>[argCount];
     for (int i = 0; i < argCount; ++i) {
@@ -1423,7 +1426,8 @@ jsValue jsObject(jsExecState es, jsData* data)
     return retValue;
 }
 
-void jsFunctionConstructCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+void jsFunctionConstructCallback(const v8::FunctionCallbackInfo<v8::Value>& args)
+{
     v8::Isolate* isolate = args.GetIsolate();
 //     if (!args.IsConstructCall())
 //         return;
@@ -1534,7 +1538,19 @@ jsExecState createTempExecStateByV8Context(v8::Local<v8::Context> context)
     return execState;
 }
 
-void onCreateGlobalObject(content::WebFrameClientImpl* client, blink::WebLocalFrame* frame, v8::Local<v8::Context> context, int extensionGroup, int worldId)
+void onCreateGlobalObjectInSubFrame(content::WebFrameClientImpl* client, blink::WebLocalFrame* frame, 
+    v8::Local<v8::Context> context, int extensionGroup, int worldId)
+{
+    content::WebPage* webPage = client->webPage();
+    CWebView* wkeWebView = webPage->wkeWebView();
+    if (!wkeWebView)
+        return;
+
+    v8::Isolate* isolate = context->GetIsolate();
+    setWkeWebViewToV8Context(client, context);
+}
+
+void onCreateGlobalObjectInMainFrame(content::WebFrameClientImpl* client, blink::WebLocalFrame* frame, v8::Local<v8::Context> context, int extensionGroup, int worldId)
 {
     content::WebPage* webPage = client->webPage();
     CWebView* wkeWebView = webPage->wkeWebView();

@@ -88,6 +88,7 @@ public:
     void removeObserver(WebContentsObserver* observer);
 
     wkeWebView getWkeView() const { return m_view; }
+    WindowInterface* getOwner() const { return m_owner; }
 
     void onNewWindowInBlinkThread(int width, int height, const CreateWindowParam* createWindowParam);
 
@@ -102,6 +103,8 @@ private:
     void _loadURLApi(const std::string& url);
     int getProcessIdApi() const;
     bool equalApi() const;
+
+    static void getFocusedWebContentsApi(const v8::FunctionCallbackInfo<v8::Value>& info);
 
     std::string _getURLApi();
 

@@ -5,7 +5,7 @@ const EventEmitter = require('events').EventEmitter;
 var v8Util = new (process.binding('atom_common_v8_util').v8Util)();
 v8Util.setHiddenValue(global, 'ipc', new EventEmitter());
 
-require('./electron');
+const electron = require('./electron');
 require('../common/init.js');
 
 const intlCollator = require('../common/api/intl-collator');
@@ -15,10 +15,26 @@ const path = require('path');
 const Module = require('module');
 const timers = require('timers');
 
+let nodeRequire = require;
+let nodeProcess = process;
+
+function __mbRequire__(name) {
+    var oldProcess = process;
+    process = nodeProcess;
+    var result = nodeRequire(name);
+    process = oldProcess;
+    return result;
+}
+
 // Export node bindings to global.
-window.require = require;
+window.require = __mbRequire__;
+window.require.resolve = nodeRequire.resolve;
+window.require.main = nodeRequire.main;
+window.require.extensions = nodeRequire.extensions;
+window.require.cache = nodeRequire.cache;
+
 window.module = module;
-window.miniNodeRequire = require;
+window.miniNodeRequire = __mbRequire__;
 window.miniNodeModule = module;
 window.setImmediate = timers.setImmediate;
 window.Intl = intlCollator;
@@ -67,3 +83,31 @@ global.process.on('exit', function() {
 			console.log("global.process.on exit fail:" + handle + ", " + handle._handle);
 	}
 });
+
+const resolvePromise = Promise.resolve.bind(Promise);
+
+electron.ipcRenderer.on('ELECTRON_INTERNAL_RENDERER_ASYNC_WEB_FRAME_METHOD', 
+    (event, requestId, method, args) => {
+    const responseCallback = function (result) {
+        resolvePromise(result)
+          .then((resolvedResult) => {
+              event.sender.send(`ELECTRON_INTERNAL_BROWSER_ASYNC_WEB_FRAME_RESPONSE_${requestId}`, null, resolvedResult);
+          })
+          .catch((resolvedError) => {
+              if (resolvedError instanceof Error) {
+                  // Errors get lost, because: JSON.stringify(new Error('Message')) === {}
+                  // Take the serializable properties and construct a generic object
+                  resolvedError = {
+                      message: resolvedError.message,
+                      stack: resolvedError.stack,
+                      name: resolvedError.name,
+                      __ELECTRON_SERIALIZED_ERROR__: true
+                  }
+              }
+
+              event.sender.send(`ELECTRON_INTERNAL_BROWSER_ASYNC_WEB_FRAME_RESPONSE_${requestId}`, resolvedError);
+          })
+    }
+    args.push(responseCallback);
+    electron.webFrame[method](...args);
+})

@@ -70,6 +70,7 @@
 #include "net/WebURLLoaderManagerSetupInfo.h"
 #include "net/WebURLLoaderManagerAsynTask.h"
 #include "net/InitializeHandleInfo.h"
+#include "net/HeaderVisitor.h"
 #include "wke/wkeNetHook.h"
 #include "third_party/WebKit/Source/wtf/Threading.h"
 #include "third_party/WebKit/Source/wtf/Vector.h"
@@ -80,6 +81,7 @@
 
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
 #include "wke/wkeWebView.h"
+extern bool g_isDecodeUrlRequest;
 #endif
 #include "wtf/RefCountedLeakCounter.h"
 
@@ -415,6 +417,22 @@ static size_t headerCallbackOnIoThread(char* ptr, size_t size, size_t nmemb, voi
     return totalSize;
 }
 
+static curlioerr ioctlCallbackOnIoThread(CURL* handle, int cmd, void* data)
+{
+    int jobId = (int)data;
+    AutoLockJob autoLockJob(WebURLLoaderManager::sharedInstance(), jobId);
+    WebURLLoaderInternal* job = autoLockJob.lock();
+    if (!job || job->isCancelled())
+        return CURLIOE_UNKNOWNCMD;
+
+    if (cmd == CURLIOCMD_RESTARTREAD) {
+        job->m_formDataStream->reset();
+
+        return CURLIOE_OK;
+    }
+    return CURLIOE_UNKNOWNCMD;
+}
+
 size_t readCallbackOnIoThread(void* ptr, size_t size, size_t nmemb, void* data)
 {
     int jobId = (int)data;
@@ -634,6 +652,9 @@ static void setupFormDataOnIoThread(WebURLLoaderInternal* job, SetupDataInfo* in
     job->m_formDataStream = new FlattenHTTPBodyElementStream(info->flattenElements);
     curl_easy_setopt(job->m_handle, CURLOPT_READFUNCTION, readCallbackOnIoThread);
     curl_easy_setopt(job->m_handle, CURLOPT_READDATA, job->m_id);
+
+    curl_easy_setopt(job->m_handle, CURLOPT_IOCTLFUNCTION, ioctlCallbackOnIoThread);
+    curl_easy_setopt(job->m_handle, CURLOPT_IOCTLDATA, job->m_id);
 }
 
 static void flattenHTTPBodyBlobElement(const WebString& blobUUID, curl_off_t* size, WTF::Vector<FlattenHTTPBodyElement*>* flattenElements)
@@ -688,25 +709,25 @@ static void flattenHTTPBodyBlobElement(const WebString& blobUUID, curl_off_t* si
 
 static void dispatchPostBodyToWke(WebURLLoaderInternal* job, WTF::Vector<FlattenHTTPBodyElement*>* flattenElements)
 {
-    RequestExtraData* requestExtraData = reinterpret_cast<RequestExtraData*>(job->firstRequest()->extraData());
-    if (!requestExtraData)
-        return;
-
-    WebPage* page = requestExtraData->page;
-    if (!page->wkeHandler().otherLoadCallback)
-        return;
-
-    wkeTempCallbackInfo* tempInfo = wkeGetTempCallbackInfo(page->wkeWebView());
-    Vector<char> urlBuf = WTF::ensureStringToUTF8(job->firstRequest()->url().string(), true);
-    tempInfo->url = urlBuf.data();
-
-    tempInfo->postBody = wke::flattenHTTPBodyElementToWke(*flattenElements);
-    
-    page->wkeHandler().otherLoadCallback(page->wkeWebView(), page->wkeHandler().otherLoadCallbackParam, WKE_DID_POST_REQUEST, tempInfo);
-    if (tempInfo->postBody->isDirty)
-        wke::wkeflattenElementToBlink(*tempInfo->postBody, flattenElements);
-    else
-        wkeNetFreePostBodyElements(tempInfo->postBody);
+//     RequestExtraData* requestExtraData = reinterpret_cast<RequestExtraData*>(job->firstRequest()->extraData());
+//     if (!requestExtraData)
+//         return;
+// 
+//     WebPage* page = requestExtraData->page;
+//     if (!page->wkeHandler().otherLoadCallback)
+//         return;
+// 
+//     wkeTempCallbackInfo* tempInfo = wkeGetTempCallbackInfo(page->wkeWebView());
+//     Vector<char> urlBuf = WTF::ensureStringToUTF8(job->firstRequest()->url().string(), true);
+//     tempInfo->url = urlBuf.data();
+// 
+//     tempInfo->postBody = wke::flattenHTTPBodyElementToWke(*flattenElements);
+//     
+//     page->wkeHandler().otherLoadCallback(page->wkeWebView(), page->wkeHandler().otherLoadCallbackParam, WKE_DID_POST_REQUEST, tempInfo);
+//     if (tempInfo->postBody->isDirty)
+//         wke::wkeflattenElementToBlink(*tempInfo->postBody, flattenElements);
+//     else
+//         wkeNetFreePostBodyElements(tempInfo->postBody);
 }
 
 static SetupDataInfo* setupFormDataOnMainThread(WebURLLoaderInternal* job, CURLoption sizeOption, struct curl_slist** headers)
@@ -832,21 +853,13 @@ static void setupPostOnIoThread(WebURLLoaderInternal* job, SetupPostInfo* info)
 
 static SetupPostInfo* setupPostOnMainThread(WebURLLoaderInternal* job, struct curl_slist** headers)
 {
-    *headers = curl_slist_append(*headers, "Expect:100-continue"); // Disable the Expect: 100 continue header
+    // *headers = curl_slist_append(*headers, "Expect:100-continue"); // Disable the Expect: 100 continue header
 
     size_t numElements = getFormElementsCount(job);
     if (!numElements)
         return nullptr;
 
     SetupPostInfo* result = new SetupPostInfo();
-
-    // Do not stream for simple POST data
-//     if (numElements == 1) {
-//         flattenHttpBody(job->firstRequest()->httpBody(), &job->m_postBytes);
-//         return result;
-//     }
-// 
-//     flattenHttpBody(job->firstRequest()->httpBody(), &job->m_postBytes);
     result->data = setupFormDataOnMainThread(job, CURLOPT_POSTFIELDSIZE_LARGE, headers);
     return result;
 }
@@ -1003,6 +1016,11 @@ int WebURLLoaderManager::addAsynchronousJob(WebURLLoaderInternal* job)
         OutputDebugStringW(outString.charactersWithNullTermination().data());
     }
 #endif
+
+    if (g_isDecodeUrlRequest) {
+        url = blink::decodeURLEscapeSequences(url);
+        job->firstRequest()->setURL((blink::KURL(blink::ParsedURLString, url)));
+    }
 
     String referer = job->firstRequest()->httpHeaderField(WebString::fromUTF8("referer"));
     job->m_manager = this;
@@ -1238,30 +1256,6 @@ void WebURLLoaderManager::applyAuthenticationToRequest(WebURLLoaderInternal* han
     //curl_easy_setopt(job->m_handle, CURLOPT_USERPWD, ":");
 }
 
-class HeaderVisitor : public blink::WebHTTPHeaderVisitor {
-public:
-    explicit HeaderVisitor(curl_slist** headers) : m_headers(headers) {}
-
-    virtual void visitHeader(const WebString& webName, const WebString& webValue) override
-    {
-        String value = webValue;
-        String headerString(webName);
-        if (value.isNull() || value.isEmpty())
-            // Insert the ; to tell curl that this header has an empty value.
-            headerString.append(";");
-        else {
-            headerString.append(": ");
-            headerString.append(value);
-        }
-        CString headerLatin1 = headerString.latin1();
-        *m_headers = curl_slist_append(*m_headers, headerLatin1.data());
-    }
-
-    curl_slist* headers() { return*m_headers; }
-private:
-    curl_slist** m_headers;
-};
-
 InitializeHandleInfo* WebURLLoaderManager::preInitializeHandleOnMainThread(WebURLLoaderInternal* job)
 {
     InitializeHandleInfo* info = new InitializeHandleInfo();
@@ -1396,7 +1390,7 @@ void WebURLLoaderManager::initializeHandleOnIoThread(int jobId, InitializeHandle
 
     curl_easy_setopt(job->m_handle, CURLOPT_URL, job->m_url);
 
-    if (m_cookieJarFileName) {
+    if (m_cookieJarFileName && '\0' != m_cookieJarFileName[0]) {
         curl_easy_setopt(job->m_handle, CURLOPT_COOKIEJAR, m_cookieJarFileName);
         curl_easy_setopt(job->m_handle, CURLOPT_COOKIEFILE, m_cookieJarFileName);
     }
@@ -1459,16 +1453,17 @@ int WebURLLoaderManager::initializeHandleOnMainThread(WebURLLoaderInternal* job)
     int jobId = addLiveJobs(job);
 
     InitializeHandleInfo* info = preInitializeHandleOnMainThread(job);
-    
+    job->m_initializeHandleInfo = info;
+
 #if (defined ENABLE_WKE) && (ENABLE_WKE == 1)
     if (dispatchWkeLoadUrlBegin(job, info)) {
         if (job->m_isWkeNetSetDataBeSetted)
             Platform::current()->currentThread()->scheduler()->postLoadingTask(FROM_HERE, new WkeAsynTask(this, jobId)); // postLoadingTask
         
-        if (!job->m_isHoldJobToAsynCommit)
+        if (!job->m_isHoldJobToAsynCommit) {
+            job->m_initializeHandleInfo = nullptr;
             delete info;
-        else
-            job->m_initializeHandleInfo = info;
+        }
         return jobId;
     }
 #endif
